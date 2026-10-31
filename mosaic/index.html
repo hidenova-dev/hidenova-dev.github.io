@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>モザイク専用（ブラウザ版）</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  body { font-family: sans-serif; margin: 16px; background: #111; color: #eee; }
+  h1 { font-size: 20px; margin: 4px 0 8px; }
+  .note { color: #bbb; font-size: 13px; }
+  button { font-size: 15px; padding: 8px 14px; margin: 4px 4px 4px 0; border-radius: 8px; border: 0; background: #2b6cb0; color: #fff; }
+  button:disabled { background: #555; }
+  input[type="range"] { width: 100%; }
+  #stage { position: relative; width: 100%; max-width: 640px; background: #000; touch-action: none; margin-top: 10px; }
+  #v { width: 100%; display: block; }
+  #rect { position: absolute; border: 2px solid #ffeb3b; background: rgba(255,235,59,.22); box-sizing: border-box; }
+  #handle { position: absolute; right: -4px; bottom: -4px; width: 30px; height: 30px; background: #ffeb3b; border-radius: 4px; }
+  .row { max-width: 640px; margin-top: 8px; }
+  #bar { width: 100%; max-width: 640px; height: 10px; background: #333; border-radius: 5px; overflow: hidden; display: none; }
+  #barIn { height: 100%; width: 0%; background: #48bb78; }
+  #status { margin-top: 8px; font-size: 14px; }
+  #out { width: 100%; max-width: 640px; display: none; margin-top: 8px; }
+  a.dl { display: none; margin-top: 8px; color: #90cdf4; font-size: 16px; }
+</style>
+</head>
+<body>
+<h1>モザイク専用（ブラウザ版）</h1>
+<p class="note">動画の一部分にモザイクをかけるだけのアプリです。処理はこの端末の中だけで行われ、動画が外部に送信されることはありません。</p>
+
+<input type="file" id="file" accept="video/*">
+
+<div id="stage" style="display:none">
+  <video id="v" playsinline></video>
+  <div id="rect"><div id="handle"></div></div>
+</div>
+
+<div class="row" id="controls" style="display:none">
+  <button id="playBtn">再生</button>
+  <span id="timeLabel">0:00 / 0:00</span>
+  <input type="range" id="seek" min="0" max="100" step="0.01" value="0">
+  <div>
+    <button id="startBtn">ここを開始に</button>
+    <button id="endBtn">ここを終了に</button>
+  </div>
+  <div id="rangeLabel"></div>
+  <div>モザイクの粗さ: <span id="blockLabel">28px</span></div>
+  <input type="range" id="block" min="8" max="96" step="1" value="28">
+  <button id="convertBtn">書き出し（モザイクをかける）</button>
+  <div id="bar"><div id="barIn"></div></div>
+  <div id="status"></div>
+  <video id="out" controls playsinline></video>
+  <a class="dl" id="dl">変換した動画をダウンロード</a>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fileEl = $("file"), v = $("v"), stage = $("stage"), rect = $("rect");
+const R = { l: 0.30, t: 0.30, r: 0.70, b: 0.65 }; // normalized region
+let duration = 0, startT = 0, endT = -1, seeking = false;
+let audioCtx = null, audioDest = null, audioSrc = null;
+
+function fmt(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  s = Math.floor(s);
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+function renderRect() {
+  rect.style.left = (R.l * 100) + "%";
+  rect.style.top = (R.t * 100) + "%";
+  rect.style.width = ((R.r - R.l) * 100) + "%";
+  rect.style.height = ((R.b - R.t) * 100) + "%";
+}
+function updateRange() {
+  $("rangeLabel").textContent = "モザイクをかける時間: " + fmt(startT) + " 〜 " + (endT < 0 ? "最後まで" : fmt(endT));
+}
+function updateBlock() { $("blockLabel").textContent = $("block").value + "px"; }
+
+fileEl.addEventListener("change", () => {
+  const f = fileEl.files[0];
+  if (!f) return;
+  v.src = URL.createObjectURL(f);
+  v.onloadedmetadata = () => {
+    duration = v.duration;
+    stage.style.aspectRatio = v.videoWidth + " / " + v.videoHeight;
+    stage.style.display = "block";
+    $("controls").style.display = "block";
+    $("seek").max = duration;
+    startT = 0; endT = -1;
+    updateRange(); renderRect();
+    $("status").textContent = "黄色い四角を指で動かして、モザイクをかけたい場所に合わせてね";
+  };
+});
+
+$("playBtn").addEventListener("click", () => { v.paused ? v.play() : v.pause(); });
+v.addEventListener("play", () => $("playBtn").textContent = "一時停止");
+v.addEventListener("pause", () => $("playBtn").textContent = "再生");
+v.addEventListener("timeupdate", () => {
+  if (!seeking) $("seek").value = v.currentTime;
+  $("timeLabel").textContent = fmt(v.currentTime) + " / " + fmt(duration);
+});
+$("seek").addEventListener("input", () => { v.currentTime = parseFloat($("seek").value); });
+$("startBtn").addEventListener("click", () => {
+  startT = v.currentTime;
+  if (endT >= 0 && endT <= startT) endT = -1;
+  updateRange();
+});
+$("endBtn").addEventListener("click", () => {
+  endT = (v.currentTime >= duration - 0.05) ? -1 : v.currentTime;
+  if (endT >= 0 && endT <= startT) startT = 0;
+  updateRange();
+});
+$("block").addEventListener("input", updateBlock);
+updateBlock();
+
+// --- rectangle drag / resize (pointer events, normalized coords) ---
+let dragMode = 0, lastX = 0, lastY = 0;
+function posNorm(e) {
+  const b = stage.getBoundingClientRect();
+  return { x: (e.clientX - b.left) / b.width, y: (e.clientY - b.top) / b.height };
+}
+stage.addEventListener("pointerdown", e => {
+  if (!duration) return;
+  const p = posNorm(e);
+  const nearHandle = Math.abs(p.x - R.r) < 0.09 && Math.abs(p.y - R.b) < 0.09;
+  if (nearHandle) dragMode = 2;
+  else if (p.x >= R.l && p.x <= R.r && p.y >= R.t && p.y <= R.b) dragMode = 1;
+  else dragMode = 0;
+  lastX = p.x; lastY = p.y;
+  if (dragMode) stage.setPointerCapture(e.pointerId);
+});
+stage.addEventListener("pointermove", e => {
+  if (!dragMode) return;
+  const p = posNorm(e);
+  const dx = p.x - lastX, dy = p.y - lastY;
+  const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  if (dragMode === 1) {
+    const w = R.r - R.l, h = R.b - R.t;
+    R.l = clamp(R.l + dx, 0, 1 - w); R.t = clamp(R.t + dy, 0, 1 - h);
+    R.r = R.l + w; R.b = R.t + h;
+  } else {
+    R.r = clamp(R.r + dx, R.l + 0.05, 1);
+    R.b = clamp(R.b + dy, R.t + 0.05, 1);
+  }
+  lastX = p.x; lastY = p.y;
+  renderRect();
+});
+["pointerup", "pointercancel"].forEach(ev => stage.addEventListener(ev, () => dragMode = 0));
+
+// --- conversion ---
+$("convertBtn").addEventListener("click", async () => {
+  if (!duration) return;
+  if (!("MediaRecorder" in window) || !HTMLCanvasElement.prototype.captureStream) {
+    $("status").textContent = "このブラウザでは変換機能が使えませんでした。AndroidのChromeで開いてみてください。";
+    return;
+  }
+  const btn = $("convertBtn");
+  btn.disabled = true;
+  $("bar").style.display = "block";
+  $("barIn").style.width = "0%";
+  $("status").textContent = "変換中… 動画の長さと同じくらい時間がかかります。画面を閉じないでね";
+
+  const W = v.videoWidth, H = v.videoHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const cx = canvas.getContext("2d");
+  const tmp = document.createElement("canvas");
+  const tx = tmp.getContext("2d");
+  const block = parseInt($("block").value, 10);
+
+  // audio path (created once; element output is routed through the graph afterwards)
+  let stream;
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioSrc = audioCtx.createMediaElementSource(v);
+      audioDest = audioCtx.createMediaStreamDestination();
+      audioSrc.connect(audioDest);
+      audioSrc.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    stream = new MediaStream([
+      ...canvas.captureStream(30).getVideoTracks(),
+      ...audioDest.stream.getAudioTracks()
+    ]);
+  } catch (e) {
+    stream = canvas.captureStream(30); // video only fallback
+  }
+
+  const candidates = [
+    'video/mp4;codecs="avc1.640028,mp4a.40.2"',
+    "video/mp4",
+    "video/webm;codecs=vp9,opus",
+    "video/webm;codecs=vp8,opus",
+    "video/webm"
+  ];
+  const mime = candidates.find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (e) { return false; } }) || "";
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : { videoBitsPerSecond: 8_000_000 });
+  const chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  const stopped = new Promise(res => rec.onstop = res);
+
+  function drawFrame() {
+    cx.drawImage(v, 0, 0, W, H);
+    const t = v.currentTime;
+    if (t >= startT && (endT < 0 || t <= endT)) {
+      const rx = Math.round(R.l * W), ry = Math.round(R.t * H);
+      const rw = Math.max(1, Math.round((R.r - R.l) * W)), rh = Math.max(1, Math.round((R.b - R.t) * H));
+      const tw = Math.max(1, Math.round(rw / block)), th = Math.max(1, Math.round(rh / block));
+      tmp.width = tw; tmp.height = th;
+      tx.imageSmoothingEnabled = true;
+      tx.drawImage(canvas, rx, ry, rw, rh, 0, 0, tw, th);
+      cx.imageSmoothingEnabled = false;
+      cx.drawImage(tmp, 0, 0, tw, th, rx, ry, rw, rh);
+      cx.imageSmoothingEnabled = true;
+    }
+    $("barIn").style.width = Math.min(99, t / duration * 100) + "%";
+  }
+
+  v.pause();
+  v.currentTime = 0;
+  await new Promise(res => v.addEventListener("seeked", res, { once: true }));
+  drawFrame();
+  rec.start(200);
+  await v.play();
+  await new Promise(res => {
+    const onEnded = () => res();
+    v.addEventListener("ended", onEnded, { once: true });
+    const loop = () => {
+      drawFrame();
+      if (!v.ended) {
+        if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop);
+        else requestAnimationFrame(loop);
+      }
+    };
+    loop();
+  });
+  setTimeout(() => rec.stop(), 300);
+  await stopped;
+
+  const type = mime.includes("mp4") ? "video/mp4" : "video/webm";
+  const blob = new Blob(chunks, { type });
+  const url = URL.createObjectURL(blob);
+  const out = $("out");
+  out.src = url;
+  out.style.display = "block";
+  const dl = $("dl");
+  dl.href = url;
+  dl.download = "mosaic_output." + (type === "video/mp4" ? "mp4" : "webm");
+  dl.style.display = "inline-block";
+  $("barIn").style.width = "100%";
+  $("status").textContent = "完了！ 下のプレビューで確認して、ダウンロードしてね";
+  btn.disabled = false;
+});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+ "background_color": "#111111",
+ "display": "standalone",
+ "icons": [
+  {
+   "src": "icon.svg",
+   "sizes": "any",
+   "type": "image/svg+xml",
+   "purpose": "any"
+  }
+ ],
+ "name": "モザイク専用（ブラウザ版）",
+ "scope": "./",
+ "short_name": "モザイク専用",
+ "start_url": "./",
+ "theme_color": "#111111"
+}
