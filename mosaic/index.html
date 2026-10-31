@@ -11,6 +11,7 @@
   .note { color: #bbb; font-size: 13px; }
   button { font-size: 15px; padding: 8px 14px; margin: 4px 4px 4px 0; border-radius: 8px; border: 0; background: #2b6cb0; color: #fff; }
   button:disabled { background: #555; }
+  input:disabled { opacity: .5; }
   input[type="range"] { width: 100%; }
   #stage { position: relative; width: 100%; max-width: 640px; background: #000; touch-action: none; margin-top: 10px; }
   #v { width: 100%; display: block; }
@@ -60,6 +61,7 @@ const fileEl = $("file"), v = $("v"), stage = $("stage"), rect = $("rect");
 const R = { l: 0.30, t: 0.30, r: 0.70, b: 0.65 }; // normalized region
 let duration = 0, startT = 0, endT = -1, seeking = false;
 let audioCtx = null, audioDest = null, audioSrc = null;
+let converting = false, inputUrl = null, outputUrl = null, loadingFile = false;
 
 function fmt(s) {
   if (!isFinite(s) || s < 0) s = 0;
@@ -76,37 +78,72 @@ function updateRange() {
   $("rangeLabel").textContent = "モザイクをかける時間: " + fmt(startT) + " 〜 " + (endT < 0 ? "最後まで" : fmt(endT));
 }
 function updateBlock() { $("blockLabel").textContent = $("block").value + "px"; }
+function setControlsEnabled(on) {
+  ["file", "playBtn", "seek", "startBtn", "endBtn", "block", "convertBtn"].forEach(id => { $(id).disabled = !on; });
+}
+function clearOutput() {
+  if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
+  const out = $("out");
+  out.removeAttribute("src");
+  out.style.display = "none";
+  const dl = $("dl");
+  dl.removeAttribute("href");
+  dl.style.display = "none";
+}
 
 fileEl.addEventListener("change", () => {
   const f = fileEl.files[0];
   if (!f) return;
-  v.src = URL.createObjectURL(f);
-  v.onloadedmetadata = () => {
-    duration = v.duration;
-    stage.style.aspectRatio = v.videoWidth + " / " + v.videoHeight;
-    stage.style.display = "block";
-    $("controls").style.display = "block";
-    $("seek").max = duration;
-    startT = 0; endT = -1;
-    updateRange(); renderRect();
-    $("status").textContent = "黄色い四角を指で動かして、モザイクをかけたい場所に合わせてね";
-  };
+  if (f.type && !f.type.startsWith("video/")) {
+    $("status").textContent = "動画ファイルを選んでください。";
+    return;
+  }
+  clearOutput();
+  if (inputUrl) URL.revokeObjectURL(inputUrl);
+  inputUrl = URL.createObjectURL(f);
+  loadingFile = true;
+  duration = 0;
+  v.src = inputUrl;
 });
+v.addEventListener("loadedmetadata", () => {
+  loadingFile = false;
+  if (!v.videoWidth || !v.videoHeight || !isFinite(v.duration)) {
+    $("status").textContent = "この動画は読み込めませんでした。対応していない形式の可能性があります。";
+    stage.style.display = "none";
+    $("controls").style.display = "none";
+    return;
+  }
+  duration = v.duration;
+  stage.style.aspectRatio = v.videoWidth + " / " + v.videoHeight;
+  stage.style.display = "block";
+  $("controls").style.display = "block";
+  $("seek").max = duration;
+  startT = 0; endT = -1;
+  updateRange(); renderRect();
+  $("status").textContent = "黄色い四角を指で動かして、モザイクをかけたい場所に合わせてね";
+});
+v.addEventListener("error", () => {
+  if (!loadingFile) return;
+  loadingFile = false;
+  $("status").textContent = "動画の読み込みに失敗しました。壊れているか、対応していない形式の可能性があります。";
+}, true);
 
-$("playBtn").addEventListener("click", () => { v.paused ? v.play() : v.pause(); });
+$("playBtn").addEventListener("click", () => { if (!converting) { v.paused ? v.play() : v.pause(); } });
 v.addEventListener("play", () => $("playBtn").textContent = "一時停止");
 v.addEventListener("pause", () => $("playBtn").textContent = "再生");
 v.addEventListener("timeupdate", () => {
   if (!seeking) $("seek").value = v.currentTime;
   $("timeLabel").textContent = fmt(v.currentTime) + " / " + fmt(duration);
 });
-$("seek").addEventListener("input", () => { v.currentTime = parseFloat($("seek").value); });
+$("seek").addEventListener("input", () => { if (!converting) v.currentTime = parseFloat($("seek").value); });
 $("startBtn").addEventListener("click", () => {
+  if (converting) return;
   startT = v.currentTime;
   if (endT >= 0 && endT <= startT) endT = -1;
   updateRange();
 });
 $("endBtn").addEventListener("click", () => {
+  if (converting) return;
   endT = (v.currentTime >= duration - 0.05) ? -1 : v.currentTime;
   if (endT >= 0 && endT <= startT) startT = 0;
   updateRange();
@@ -121,7 +158,7 @@ function posNorm(e) {
   return { x: (e.clientX - b.left) / b.width, y: (e.clientY - b.top) / b.height };
 }
 stage.addEventListener("pointerdown", e => {
-  if (!duration) return;
+  if (!duration || converting) return;
   const p = posNorm(e);
   const nearHandle = Math.abs(p.x - R.r) < 0.09 && Math.abs(p.y - R.b) < 0.09;
   if (nearHandle) dragMode = 2;
@@ -131,7 +168,7 @@ stage.addEventListener("pointerdown", e => {
   if (dragMode) stage.setPointerCapture(e.pointerId);
 });
 stage.addEventListener("pointermove", e => {
-  if (!dragMode) return;
+  if (!dragMode || converting) return;
   const p = posNorm(e);
   const dx = p.x - lastX, dy = p.y - lastY;
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
@@ -150,113 +187,160 @@ stage.addEventListener("pointermove", e => {
 
 // --- conversion ---
 $("convertBtn").addEventListener("click", async () => {
-  if (!duration) return;
+  if (!duration || converting) return;
   if (!("MediaRecorder" in window) || !HTMLCanvasElement.prototype.captureStream) {
     $("status").textContent = "このブラウザでは変換機能が使えませんでした。AndroidのChromeで開いてみてください。";
     return;
   }
-  const btn = $("convertBtn");
-  btn.disabled = true;
+  // Snapshot the settings so mid-conversion edits can never change the output.
+  const S = { l: R.l, t: R.t, r: R.r, b: R.b, startT, endT, block: parseInt($("block").value, 10), duration };
+  converting = true;
+  setControlsEnabled(false);
   $("bar").style.display = "block";
   $("barIn").style.width = "0%";
   $("status").textContent = "変換中… 動画の長さと同じくらい時間がかかります。画面を閉じないでね";
 
-  const W = v.videoWidth, H = v.videoHeight;
-  const canvas = document.createElement("canvas");
-  canvas.width = W; canvas.height = H;
-  const cx = canvas.getContext("2d");
-  const tmp = document.createElement("canvas");
-  const tx = tmp.getContext("2d");
-  const block = parseInt($("block").value, 10);
-
-  // audio path (created once; element output is routed through the graph afterwards)
-  let stream;
+  let rec = null, videoStream = null, watchdog = null, finished = false;
   try {
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      audioSrc = audioCtx.createMediaElementSource(v);
-      audioDest = audioCtx.createMediaStreamDestination();
-      audioSrc.connect(audioDest);
-      audioSrc.connect(audioCtx.destination);
-    }
-    if (audioCtx.state === "suspended") await audioCtx.resume();
-    stream = new MediaStream([
-      ...canvas.captureStream(30).getVideoTracks(),
-      ...audioDest.stream.getAudioTracks()
-    ]);
-  } catch (e) {
-    stream = canvas.captureStream(30); // video only fallback
-  }
+    const W = v.videoWidth, H = v.videoHeight;
+    const canvas = document.createElement("canvas");
+    canvas.width = W; canvas.height = H;
+    const cx = canvas.getContext("2d");
+    const tmp = document.createElement("canvas");
+    const tx = tmp.getContext("2d");
 
-  const candidates = [
-    'video/mp4;codecs="avc1.640028,mp4a.40.2"',
-    "video/mp4",
-    "video/webm;codecs=vp9,opus",
-    "video/webm;codecs=vp8,opus",
-    "video/webm"
-  ];
-  const mime = candidates.find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (e) { return false; } }) || "";
-  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : { videoBitsPerSecond: 8_000_000 });
-  const chunks = [];
-  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-  const stopped = new Promise(res => rec.onstop = res);
-
-  function drawFrame() {
-    cx.drawImage(v, 0, 0, W, H);
-    const t = v.currentTime;
-    if (t >= startT && (endT < 0 || t <= endT)) {
-      const rx = Math.round(R.l * W), ry = Math.round(R.t * H);
-      const rw = Math.max(1, Math.round((R.r - R.l) * W)), rh = Math.max(1, Math.round((R.b - R.t) * H));
-      const tw = Math.max(1, Math.round(rw / block)), th = Math.max(1, Math.round(rh / block));
-      tmp.width = tw; tmp.height = th;
-      tx.imageSmoothingEnabled = true;
-      tx.drawImage(canvas, rx, ry, rw, rh, 0, 0, tw, th);
-      cx.imageSmoothingEnabled = false;
-      cx.drawImage(tmp, 0, 0, tw, th, rx, ry, rw, rh);
-      cx.imageSmoothingEnabled = true;
-    }
-    $("barIn").style.width = Math.min(99, t / duration * 100) + "%";
-  }
-
-  v.pause();
-  v.currentTime = 0;
-  await new Promise(res => v.addEventListener("seeked", res, { once: true }));
-  drawFrame();
-  rec.start(200);
-  await v.play();
-  await new Promise(res => {
-    const onEnded = () => res();
-    v.addEventListener("ended", onEnded, { once: true });
-    const loop = () => {
-      drawFrame();
-      if (!v.ended) {
-        if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop);
-        else requestAnimationFrame(loop);
+    // audio path (created once; element output is routed through the graph afterwards)
+    let stream, audioMissing = false;
+    videoStream = canvas.captureStream(30);
+    try {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioSrc = audioCtx.createMediaElementSource(v);
+        audioDest = audioCtx.createMediaStreamDestination();
+        audioSrc.connect(audioDest);
+        audioSrc.connect(audioCtx.destination);
       }
-    };
-    loop();
-  });
-  setTimeout(() => rec.stop(), 300);
-  await stopped;
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      const aTracks = audioDest.stream.getAudioTracks();
+      if (!aTracks.length) throw new Error("no audio track");
+      stream = new MediaStream([...videoStream.getVideoTracks(), ...aTracks]);
+    } catch (e) {
+      audioMissing = true;
+      stream = videoStream; // video only fallback (reported to the user below)
+    }
 
-  const rawBlob = new Blob(chunks, { type: rec.mimeType || mime });
-  // Decide the real container from the file signature, not the requested mime:
-  // some browsers report mp4 support but actually record WebM.
-  const head = new Uint8Array(await rawBlob.slice(0, 12).arrayBuffer());
-  const isWebm = head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
-  const type = isWebm ? "video/webm" : "video/mp4";
-  const blob = new Blob([rawBlob], { type });
-  const url = URL.createObjectURL(blob);
-  const out = $("out");
-  out.src = url;
-  out.style.display = "block";
-  const dl = $("dl");
-  dl.href = url;
-  dl.download = "mosaic_output." + (type === "video/mp4" ? "mp4" : "webm");
-  dl.style.display = "inline-block";
-  $("barIn").style.width = "100%";
-  $("status").textContent = "完了！ 下のプレビューで確認して、ダウンロードしてね";
-  btn.disabled = false;
+    const candidates = [
+      'video/mp4;codecs="avc1.640028,mp4a.40.2"',
+      "video/mp4",
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm"
+    ];
+    const mime = candidates.find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (e) { return false; } }) || "";
+    rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : { videoBitsPerSecond: 8_000_000 });
+    const chunks = [];
+    let recError = null;
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    rec.onerror = e => { recError = (e && e.error) || new Error("recorder error"); };
+    const stopped = new Promise(res => rec.onstop = res);
+
+    function drawFrame() {
+      cx.drawImage(v, 0, 0, W, H);
+      const t = v.currentTime;
+      if (t >= S.startT && (S.endT < 0 || t <= S.endT)) {
+        const rx = Math.round(S.l * W), ry = Math.round(S.t * H);
+        const rw = Math.max(1, Math.round((S.r - S.l) * W)), rh = Math.max(1, Math.round((S.b - S.t) * H));
+        const tw = Math.max(1, Math.round(rw / S.block)), th = Math.max(1, Math.round(rh / S.block));
+        tmp.width = tw; tmp.height = th;
+        tx.imageSmoothingEnabled = true;
+        tx.drawImage(canvas, rx, ry, rw, rh, 0, 0, tw, th);
+        cx.imageSmoothingEnabled = false;
+        cx.drawImage(tmp, 0, 0, tw, th, rx, ry, rw, rh);
+        cx.imageSmoothingEnabled = true;
+      }
+      $("barIn").style.width = Math.min(99, t / S.duration * 100) + "%";
+    }
+
+    v.pause();
+    v.currentTime = 0;
+    await new Promise((res, rej) => {
+      const to = setTimeout(() => rej(new Error("動画の先頭への移動がタイムアウトしました")), 10000);
+      v.addEventListener("seeked", () => { clearTimeout(to); res(); }, { once: true });
+    });
+    drawFrame();
+    watchdog = setTimeout(() => {
+      if (!finished) {
+        finished = true;
+        try { if (rec && rec.state !== "inactive") rec.stop(); } catch (e) {}
+        $("status").textContent = "変換が時間内に終わりませんでした。短い動画で試すか、もう一度やってみてください。";
+      }
+    }, (S.duration + 30) * 1000);
+    rec.start(200);
+    await v.play();
+    await new Promise((res, rej) => {
+      v.addEventListener("ended", () => res(), { once: true });
+      v.addEventListener("error", () => rej(new Error("再生中にエラーが起きました")), { once: true });
+      const loop = () => {
+        drawFrame();
+        if (!v.ended) {
+          if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(loop);
+          else requestAnimationFrame(loop);
+        }
+      };
+      loop();
+    });
+    if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+    finished = true;
+    setTimeout(() => { try { if (rec.state !== "inactive") rec.stop(); } catch (e) {} }, 300);
+    await stopped;
+    if (recError) throw new Error("録画中にエラーが起きました");
+
+    const rawBlob = new Blob(chunks, { type: rec.mimeType || mime });
+    if (!chunks.length || rawBlob.size < 1000) throw new Error("出力が空でした。もう一度試してください");
+    // Decide the real container from the file signature, not the requested mime:
+    // some browsers report mp4 support but actually record WebM.
+    const head = new Uint8Array(await rawBlob.slice(0, 12).arrayBuffer());
+    const isWebm = head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
+    const type = isWebm ? "video/webm" : "video/mp4";
+    const blob = new Blob([rawBlob], { type });
+
+    // Verify the output actually plays before calling it done.
+    if (outputUrl) URL.revokeObjectURL(outputUrl);
+    outputUrl = URL.createObjectURL(blob);
+    await new Promise((res, rej) => {
+      const probe = document.createElement("video");
+      const to = setTimeout(() => rej(new Error("出力の確認ができませんでした")), 10000);
+      probe.addEventListener("loadedmetadata", () => {
+        clearTimeout(to);
+        if (probe.duration > 0 && probe.videoWidth > 0) res();
+        else rej(new Error("出力が正しく作られませんでした"));
+      }, { once: true });
+      probe.addEventListener("error", () => { clearTimeout(to); rej(new Error("出力が正しく作られませんでした")); }, { once: true });
+      probe.src = outputUrl;
+    });
+
+    const out = $("out");
+    out.src = outputUrl;
+    out.style.display = "block";
+    const dl = $("dl");
+    dl.href = outputUrl;
+    dl.download = "mosaic_output." + (type === "video/mp4" ? "mp4" : "webm");
+    dl.style.display = "inline-block";
+    $("barIn").style.width = "100%";
+    $("status").textContent = audioMissing
+      ? "完了！ ただし音声は含まれていません（音声の取り込みに失敗しました）。下のプレビューで確認して、ダウンロードしてね"
+      : "完了！ 下のプレビューで確認して、ダウンロードしてね";
+  } catch (err) {
+    try { if (rec && rec.state !== "inactive") rec.stop(); } catch (e) {}
+    try { v.pause(); } catch (e) {}
+    $("bar").style.display = "none";
+    $("status").textContent = "変換に失敗しました：" + (err && err.message ? err.message : "不明なエラー") + "。もう一度試してみてください。";
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
+    if (videoStream) videoStream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} });
+    converting = false;
+    setControlsEnabled(true);
+  }
 });
 
 if ("serviceWorker" in navigator) {
